@@ -1,0 +1,14 @@
+# Install with:  pip install -r requirements.txt
+# For your final submission, run `pip freeze > requirements.txt` after install
+# so every version is pinned exactly (the rubric asks for pinned versions).
+
+google-genai>=1.0.0
+asyncpg>=0.29.0
+pgvector>=0.3.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
+pypdf>=4.0.0
+numpy>=1.26.0
+python-dotenv>=1.0.0
+httpx>=0.27.0

@@ -2,9 +2,10 @@
 store.py
 Inserts chunk text, metadata, and the embedding vector into Postgres.
 
-Assumes the table and pgvector extension already exist (created by
-sql/schema.sql during setup). If the table already has rows, we skip
-re-ingestion so we do not burn embedding calls twice.
+Uses ON CONFLICT DO NOTHING against a unique key of
+(source_file, page, chunk_index) so that re running after a partial run just
+fills in the gaps instead of erroring or duplicating. This is what makes the
+ingestion resumable if Cloud Shell disconnects mid run.
 """
 import os
 import asyncpg
@@ -33,18 +34,28 @@ async def count_rows() -> int:
         await conn.close()
 
 
-async def store_chunks(records: list[dict]) -> None:
+async def existing_keys() -> set[tuple]:
+    """Return the (source_file, page, chunk_index) already stored, so the
+    orchestrator can skip re embedding work that is already done."""
     conn = await connect()
     try:
-        existing = await conn.fetchval("SELECT count(*) FROM chunks")
-        if existing and existing > 0:
-            print(f"table already has {existing} rows, skipping insert")
-            return
+        rows = await conn.fetch("SELECT source_file, page, chunk_index FROM chunks")
+        return {(r["source_file"], r["page"], r["chunk_index"]) for r in rows}
+    finally:
+        await conn.close()
+
+
+async def store_chunks(records: list[dict]) -> None:
+    if not records:
+        return
+    conn = await connect()
+    try:
         await conn.executemany(
             """
             INSERT INTO chunks
                 (source_file, series, page, chunk_index, content, embedding)
             VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (source_file, page, chunk_index) DO NOTHING
             """,
             [
                 (
@@ -58,6 +69,5 @@ async def store_chunks(records: list[dict]) -> None:
                 for r in records
             ],
         )
-        print(f"inserted {len(records)} rows into chunks")
     finally:
         await conn.close()

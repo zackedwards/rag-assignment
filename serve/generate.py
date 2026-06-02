@@ -3,7 +3,9 @@ generate.py
 Sends the retrieved chunks to Gemini 2.5 Flash as context and gets back a
 grounded answer with inline citations.
 """
+import asyncio
 import os
+import random
 from google import genai
 from google.genai import types
 
@@ -49,13 +51,21 @@ async def generate_answer(question: str, chunks: list[dict]) -> str:
         f"Question: {question}\n\n"
         f"Answer using only the context above, with inline citations."
     )
-    response = await client().aio.models.generate_content(
-        model=GEN_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.3,
-            max_output_tokens=800,
-        ),
-    )
-    return (response.text or "").strip()
+    # retry with backoff so a transient 429 or 5xx does not 500 the endpoint
+    for attempt in range(5):
+        try:
+            response = await client().aio.models.generate_content(
+                model=GEN_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.3,
+                    max_output_tokens=800,
+                ),
+            )
+            return (response.text or "").strip()
+        except Exception:
+            if attempt < 4:
+                await asyncio.sleep(min(30, 2 ** attempt) + random.uniform(0, 1))
+            else:
+                raise

@@ -6,8 +6,12 @@ For each question we call the running /query endpoint, then ask Gemini 2.5
 Flash to act as a judge and score accuracy and faithfulness from 0 to 5.
 Results are written to eval/eval_results.json.
 
-The eval is hard capped at 25 questions with no retry loop, so one run costs
-well under a dollar.
+The judge uses structured JSON output so its verdict always parses. The
+system's own answer is recorded for every question even if judging fails, so
+you can always read what the system said.
+
+The eval is hard capped at 25 questions with no retry loop around questions,
+so one run costs well under a dollar.
 
 Usage
     uvicorn serve.api:app --port 8080      # in one terminal
@@ -19,6 +23,7 @@ import os
 from pathlib import Path
 import httpx
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
@@ -36,6 +41,13 @@ client = genai.Client(
     location=os.environ["GCP_REGION"],
 )
 
+
+class Verdict(BaseModel):
+    accuracy: int
+    faithfulness: int
+    reason: str
+
+
 JUDGE_PROMPT = """You are grading a retrieval augmented question answering system.
 
 Question:
@@ -51,11 +63,9 @@ Retrieved context the system was allowed to use:
 {context}
 
 Score two things from 0 to 5.
-accuracy: is the system answer factually correct compared to the reference answer.
-faithfulness: does the system answer only make claims supported by the retrieved context.
-
-Reply with JSON only, no markdown, no commentary, in exactly this shape:
-{{"accuracy": <int 0-5>, "faithfulness": <int 0-5>, "reason": "<one short sentence>"}}"""
+accuracy is whether the system answer is factually correct compared to the reference answer.
+faithfulness is whether the system answer only makes claims supported by the retrieved context.
+Give a one sentence reason."""
 
 
 def load_golden() -> list[dict]:
@@ -69,9 +79,10 @@ def load_golden() -> list[dict]:
 
 
 async def ask_system(question: str) -> dict:
-    async with httpx.AsyncClient(timeout=60) as http:
+    async with httpx.AsyncClient(timeout=120) as http:
         resp = await http.post(API_URL, json={"question": question})
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(f"{resp.status_code} {resp.text[:300]}")
         return resp.json()
 
 
@@ -85,11 +96,20 @@ async def judge(question: str, reference: str, system_answer: str, context: str)
     resp = await client.aio.models.generate_content(
         model=JUDGE_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=300),
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=500,
+            response_mime_type="application/json",
+            response_schema=Verdict,
+        ),
     )
-    raw = (resp.text or "").strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    if getattr(resp, "parsed", None) is not None:
+        v = resp.parsed
+        return {"accuracy": v.accuracy, "faithfulness": v.faithfulness, "reason": v.reason}
+    # fallback if structured parsing did not populate
+    raw = (resp.text or "").strip().replace("```json", "").replace("```", "").strip()
+    data = json.loads(raw)
+    return {"accuracy": int(data["accuracy"]), "faithfulness": int(data["faithfulness"]), "reason": data.get("reason", "")}
 
 
 async def main() -> None:
@@ -99,38 +119,49 @@ async def main() -> None:
     for i, item in enumerate(golden, start=1):
         question = item["question"]
         reference = item.get("answer", item.get("reference_answer", ""))
+        record = {"question": question}
+
+        # 1. get the system answer, always record it
         try:
             system = await ask_system(question)
+            record["system_answer"] = system.get("answer", "")
+            record["citations"] = system.get("citations", [])
+        except Exception as e:
+            record["api_error"] = str(e)
+            per_question.append(record)
+            print(f"[{i}/{len(golden)}] api failed, skipping ({e})")
+            continue
+
+        # 2. judge it, but a judging failure does not lose the answer
+        try:
             context = "\n\n".join(system.get("retrieved_chunks", []))
-            scores = await judge(question, reference, system["answer"], context)
-            per_question.append(
-                {
-                    "question": question,
-                    "system_answer": system["answer"],
-                    "accuracy": scores["accuracy"],
-                    "faithfulness": scores["faithfulness"],
-                    "reason": scores.get("reason", ""),
-                }
-            )
+            scores = await judge(question, reference, record["system_answer"], context)
+            record["accuracy"] = scores["accuracy"]
+            record["faithfulness"] = scores["faithfulness"]
+            record["reason"] = scores["reason"]
             print(f"[{i}/{len(golden)}] acc {scores['accuracy']} faith {scores['faithfulness']}")
         except Exception as e:
-            # log and move on, no retry loop per the cost guardrail
-            print(f"[{i}/{len(golden)}] failed, skipping ({e})")
-            per_question.append({"question": question, "error": str(e)})
+            record["judge_error"] = str(e)
+            print(f"[{i}/{len(golden)}] answered but judge failed ({e})")
+
+        per_question.append(record)
 
     scored = [q for q in per_question if "accuracy" in q]
+    answered = [q for q in per_question if "system_answer" in q]
     avg_acc = sum(q["accuracy"] for q in scored) / len(scored) if scored else 0
     avg_faith = sum(q["faithfulness"] for q in scored) / len(scored) if scored else 0
 
     output = {
         "n_questions": len(golden),
+        "n_answered": len(answered),
         "n_scored": len(scored),
         "average_accuracy": round(avg_acc, 2),
         "average_faithfulness": round(avg_faith, 2),
         "per_question": per_question,
     }
     RESULTS.write_text(json.dumps(output, indent=2))
-    print(f"\naverage accuracy {avg_acc:.2f}, average faithfulness {avg_faith:.2f}")
+    print(f"\nanswered {len(answered)}/{len(golden)}, scored {len(scored)}/{len(golden)}")
+    print(f"average accuracy {avg_acc:.2f}, average faithfulness {avg_faith:.2f}")
     print(f"wrote {RESULTS}")
 
 

@@ -20,6 +20,7 @@ Usage
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 import httpx
 from dotenv import load_dotenv
@@ -86,6 +87,50 @@ async def ask_system(question: str) -> dict:
         return resp.json()
 
 
+def _parse_verdict(text: str) -> dict:
+    """Parse the judge output as forgivingly as possible.
+    Tries clean JSON, then the first JSON object in the text, then a plain
+    regex for the two integer scores. The scores are single digits, so the
+    regex path works no matter how the model mangles commas or quotes."""
+    cleaned = text.strip().replace("```json", "").replace("```", "").strip()
+
+    # try 1, straight JSON
+    try:
+        data = json.loads(cleaned)
+        return {
+            "accuracy": int(data["accuracy"]),
+            "faithfulness": int(data["faithfulness"]),
+            "reason": str(data.get("reason", "")),
+        }
+    except Exception:
+        pass
+
+    # try 2, first {...} block in the text
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            return {
+                "accuracy": int(data["accuracy"]),
+                "faithfulness": int(data["faithfulness"]),
+                "reason": str(data.get("reason", "")),
+            }
+        except Exception:
+            pass
+
+    # try 3, just pull the two numbers out, ignore formatting entirely
+    acc = re.search(r"accuracy\D{0,8}(\d)", cleaned, re.IGNORECASE)
+    faith = re.search(r"faithful\w*\D{0,8}(\d)", cleaned, re.IGNORECASE)
+    if acc and faith:
+        return {
+            "accuracy": int(acc.group(1)),
+            "faithfulness": int(faith.group(1)),
+            "reason": cleaned[:200],
+        }
+
+    raise ValueError(f"could not parse judge output: {cleaned[:200]}")
+
+
 async def judge(question: str, reference: str, system_answer: str, context: str) -> dict:
     prompt = JUDGE_PROMPT.format(
         question=question,
@@ -98,18 +143,23 @@ async def judge(question: str, reference: str, system_answer: str, context: str)
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.0,
-            max_output_tokens=500,
+            max_output_tokens=800,
             response_mime_type="application/json",
             response_schema=Verdict,
+            # turn off thinking so the whole budget goes to the JSON, not to
+            # internal reasoning that was truncating the output
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
-    if getattr(resp, "parsed", None) is not None:
-        v = resp.parsed
-        return {"accuracy": v.accuracy, "faithfulness": v.faithfulness, "reason": v.reason}
-    # fallback if structured parsing did not populate
-    raw = (resp.text or "").strip().replace("```json", "").replace("```", "").strip()
-    data = json.loads(raw)
-    return {"accuracy": int(data["accuracy"]), "faithfulness": int(data["faithfulness"]), "reason": data.get("reason", "")}
+    # prefer the SDK's validated object when present
+    parsed = getattr(resp, "parsed", None)
+    if parsed is not None:
+        return {
+            "accuracy": parsed.accuracy,
+            "faithfulness": parsed.faithfulness,
+            "reason": parsed.reason,
+        }
+    return _parse_verdict(resp.text or "")
 
 
 async def main() -> None:
